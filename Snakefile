@@ -1,10 +1,22 @@
 import yaml
+import os
+
+
+def get_account_for_jobs(wildcards):
+    """Simple alternation based on haplotype"""
+    if int(wildcards.hap) == 1:
+        return "genome-center-grp"
+    else:
+        return "mydennisgrp"
+
 
 YAML = config.get("yaml", "/quobyte/mydennisgrp/projects/vole/data_paths.yaml")
 FRAC_LABELS = [str(x) for x in range(10, 101, 10)] # 10,20,...,100
-# FRAC_LABELS = ["100"]  # for quick testing
 # 5, step of 20
 FRAC_LABELS = [str(x) for x in range(20, 101, 20)] # 20,40,60,80,100
+# FRAC_LABELS = ["100"]  # for quick testing
+# FRAC_LABELS = ["20", "40"]  # for quick testing
+
 def label_to_prop(label: str) -> float: return int(label) / 100.0
 
 with open(YAML) as fh:
@@ -36,7 +48,11 @@ CALN50_JS      = "/quobyte/mydennisgrp/mabuelanin/vole_assembly_project/scripts/
 # ---------------- Targets ----------------
 rule all:
     input:
+        # Pre-scaffolding stats
         expand("stats/{sample}/{label}/summary.tsv",
+               sample=samples_list(), label=FRAC_LABELS),
+        # Post-scaffolding (yahs) stats
+        expand("stats/{sample}/{label}/yahs_summary.tsv",
                sample=samples_list(), label=FRAC_LABELS)
 
 # ---------------- Core steps ----------------
@@ -166,6 +182,158 @@ rule summarize_assembly:
         hap2="stats/{sample}/{label}/hap2.n50.txt"
     output:
         tsv="stats/{sample}/{label}/summary.tsv"
+    threads: 1
+    resources:
+        mem_mb=2000, runtime=10, slurm_partition="high", slurm_account="mydennisgrp"
+    shell:
+        r'''
+        mkdir -p $(dirname {output.tsv})
+        echo -e "sample\tfraction\thap\tGS\tSZ\tNN\tN50\tL50\tAU" > {output.tsv}
+
+        parse_one () {{
+          IN="$1"; HAP="$2"; SAMP="{wildcards.sample}"; FRAC="{wildcards.label}";
+          GS=$(awk -F'\t' '$1=="GS"{{print $2}}' "$IN")
+          SZ=$(awk -F'\t' '$1=="SZ"{{print $2}}' "$IN")
+          NN=$(awk -F'\t' '$1=="NN"{{print $2}}' "$IN")
+          N50=$(awk -F'\t' '$1=="NL" && $2==50{{print $3}}' "$IN")
+          L50=$(awk -F'\t' '$1=="NL" && $2==50{{print $4}}' "$IN")
+          AU=$(awk -F'\t' '$1=="AU"{{print $2}}' "$IN")
+          echo -e "${{SAMP}}\t${{FRAC}}\t${{HAP}}\t${{GS}}\t${{SZ}}\t${{NN}}\t${{N50}}\t${{L50}}\t${{AU}}"
+        }}
+
+        parse_one {input.hap1} hap1 >> {output.tsv}
+        parse_one {input.hap2} hap2 >> {output.tsv}
+        '''
+
+
+rule porec_nextflow:
+    """Run epi2me-labs/wf-pore-c nextflow pipeline for Hi-C contact mapping"""
+    priority: 650
+    input:
+        cifi_bam=lambda w: next(s for s in HINDIII if s["sample"] == w.sample)["cifi_bam"],
+        ref_fa="asm/{sample}/{label}/{sample}.{label}.hap{hap}.fa"
+    output:
+        bed="porec/{sample}/{label}/hap{hap}/bed/{sample}.{label}.hap{hap}.bed",
+        pairs="porec/{sample}/{label}/hap{hap}/pairs/{sample}.{label}.hap{hap}.pairs.gz",
+        mcool="porec/{sample}/{label}/hap{hap}/pairs/{sample}.{label}.hap{hap}.mcool",
+        hic="porec/{sample}/{label}/hap{hap}/hi-c/{sample}.{label}.hap{hap}.hic",
+        report="porec/{sample}/{label}/hap{hap}/wf-pore-c-report.html"
+    params:
+        outdir="porec/{sample}/{label}/hap{hap}",
+        sample_alias="{sample}.{label}.hap{hap}",
+        cutter="HindIII",
+        nxf_cache="/quobyte/mydennisgrp/mabuelanin/cache/singularity"
+    log:
+        nf="porec/{sample}/{label}/logs/{sample}.{label}.hap{hap}.nextflow.log",
+        time="porec/{sample}/{label}/logs/{sample}.{label}.hap{hap}.time.txt"
+    threads: 15
+    resources:
+        mem_mb=150*1024, runtime=24 * 60, slurm_partition="high", slurm_account=lambda w: "mydennisgrp" if int(w.hap) == 1 else "genome-center-grp"
+    shell:
+        """
+        export NXF_SINGULARITY_CACHEDIR="{params.nxf_cache}"
+        export NXF_OPTS='-Xms2g -Xmx4g'
+        export NXF_OFFLINE='true'
+        export TMPDIR="/scratch/tmp/{wildcards.sample}.{wildcards.label}.hap{wildcards.hap}"
+        mkdir -p $TMPDIR
+        export NXF_TMP="$TMPDIR"
+        export NXF_TEMP="$TMPDIR"
+        export NXF_EXECUTOR='local'
+        
+        # Create and cd to output directory to isolate nextflow run
+        mkdir -p {params.outdir}
+        cd {params.outdir}
+        
+        /usr/bin/time -v \
+            nextflow run epi2me-labs/wf-pore-c \
+                -r v1.3.0 \
+                -profile singularity \
+                --bam {input.cifi_bam} \
+                --ref ../../../../{input.ref_fa} \
+                --cutter {params.cutter} \
+                --out_dir . \
+                --threads {threads} \
+                --minimap2_settings '-ax map-hifi' \
+                --paired_end \
+                --bed --pairs --hi_c --mcool --coverage \
+                --sample "{params.sample_alias}" \
+                -with-report   pipeline_report.html \
+                -with-timeline pipeline_timeline.html \
+                -with-trace    pipeline_trace.txt \
+                -with-dag      pipeline_dag.svg \
+                1> ../../../../{log.nf} 2> ../../../../{log.time}
+        """
+
+rule index_fa:
+    """Index FASTA files for yahs"""
+    priority: 625
+    input:
+        fa="asm/{sample}/{label}/{sample}.{label}.hap{hap}.fa"
+    output:
+        fai="asm/{sample}/{label}/{sample}.{label}.hap{hap}.fa.fai"
+    threads: 1
+    resources:
+        mem_mb=8 * 1024, runtime=60, slurm_partition="high", slurm_account="mydennisgrp"
+    shell:
+        "samtools faidx {input.fa}"
+
+
+rule yahs_scaffold:
+    """Scaffold haplotype assemblies with yahs"""
+    priority: 750
+    input:
+        asm_fa="asm/{sample}/{label}/{sample}.{label}.hap{hap}.fa",
+        asm_fai="asm/{sample}/{label}/{sample}.{label}.hap{hap}.fa.fai",
+        porec_bed="porec/{sample}/{label}/hap{hap}/bed/{sample}.{label}.hap{hap}.bed"
+    output:
+        scaffolds="yahs/{sample}/{label}/{sample}.{label}.hap{hap}_scaffolds_final.fa",
+        agp="yahs/{sample}/{label}/{sample}.{label}.hap{hap}_scaffolds_final.agp",
+        bin="yahs/{sample}/{label}/{sample}.{label}.hap{hap}.bin"
+    params:
+        prefix="yahs/{sample}/{label}/{sample}.{label}.hap{hap}"
+    log:
+        "yahs/{sample}/{label}/logs/{sample}.{label}.hap{hap}.yahs.log"
+    threads: 8
+    resources:
+        mem_mb=200*1024, runtime=48 * 60, slurm_partition="high", slurm_account=get_account_for_jobs
+    shell:
+        """
+        yahs \
+            -q 0 \
+            --no-contig-ec \
+            -o {params.prefix} \
+            -v 1 \
+            {input.asm_fa} \
+            {input.porec_bed} \
+            2>&1 | tee {log}
+        """
+
+rule yahs_caln50:
+    """Run calN50.js (k8) on each yahs scaffold FASTA"""
+    priority: 850
+    input:
+        fa="yahs/{sample}/{label}/{sample}.{label}.hap{hap}_scaffolds_final.fa"
+    output:
+        n50="stats/{sample}/{label}/yahs_hap{hap}.n50.txt"
+    threads: 1
+    resources:
+        mem_mb=4000, runtime=30, slurm_partition="high", slurm_account="mydennisgrp"
+    shell:
+        "mkdir -p $(dirname {output.n50}); "
+        "k8 {CALN50_JS} -L2.3g {input.fa} > {output.n50}"
+
+
+rule summarize_yahs:
+    """
+    Parse k8 calN50.js output from yahs scaffolds hap1/2 and write a tidy TSV with:
+    sample, fraction, hap, GS, SZ, NN, N50, L50, AU
+    """
+    priority: 900
+    input:
+        hap1="stats/{sample}/{label}/yahs_hap1.n50.txt",
+        hap2="stats/{sample}/{label}/yahs_hap2.n50.txt"
+    output:
+        tsv="stats/{sample}/{label}/yahs_summary.tsv"
     threads: 1
     resources:
         mem_mb=2000, runtime=10, slurm_partition="high", slurm_account="mydennisgrp"
