@@ -14,6 +14,8 @@ YAML = config.get("yaml", "/quobyte/mydennisgrp/projects/vole/data_paths.yaml")
 FRAC_LABELS = [str(x) for x in range(10, 101, 10)] # 10,20,...,100
 # 5, step of 20
 FRAC_LABELS = [str(x) for x in range(20, 101, 20)] # 20,40,60,80,100
+# include ad-hoc 10%
+FRAC_LABELS = ["10"] + FRAC_LABELS
 # FRAC_LABELS = ["100"]  # for quick testing
 # FRAC_LABELS = ["20", "40"]  # for quick testing
 
